@@ -1,0 +1,637 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "vnetName": {
+      "type": "string",
+      "metadata": {
+        "description": "Transit VNET naming prefix"
+      }
+    },
+    "vnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.1.0.0/24",
+      "metadata": {
+        "description": "Transit VNET prefix. This template expects a /24 and derives three /26 subnets: x.x.x.0/26, x.x.x.64/26, x.x.x.128/26."
+      }
+    },
+    "mgmtAdminPrefixes": {
+      "type": "string",
+      "metadata": {
+        "description": "Comma-separated list of allowed source IPs for management access (e.g. 1.2.3.4,5.6.7.8/32)"
+      }
+    },
+    "fwName": {
+      "type": "string",
+      "metadata": {
+        "description": "The prefix for the firewall names (e.g., 'FW' results in 'FW01')"
+      }
+    },
+    "instanceCount": {
+      "type": "int",
+      "defaultValue": 2,
+      "minValue": 1,
+      "maxValue": 10,
+      "metadata": {
+        "description": "Number of firewall instances to deploy"
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "allowedValues": ["Standard_DS3_v2"],
+      "metadata": {
+        "description": "Azure VM size for VM-Series"
+      },
+      "defaultValue": "Standard_DS3_v2"
+    },
+    "imageVersion": {
+      "type": "string",
+      "allowedValues": ["10.2.1014"],
+      "metadata": {
+        "description": "PAN OS Version"
+      },
+      "defaultValue": "10.2.1014"
+    },
+    "imageSku": {
+      "type": "string",
+      "allowedValues": ["byol", "bundle1", "bundle2"],
+      "metadata": {
+        "description": "Firewall License Model"
+      },
+      "defaultValue": "byol"
+    },
+    "bootstrapData": {
+      "type": "string",
+      "defaultValue": "type=dhcp-client\nplugin-op-commands=set-cores:2",
+      "metadata": {
+        "description": "Base64 encoded user data. Default value contains a template of common init-cfg.txt options separated by newlines."
+      }
+    },
+    "deployMgmtPublicIP": {
+      "type": "string",
+      "allowedValues": ["Yes", "No"],
+      "metadata": {
+        "description": "Deploy public IP for the firewall's management interface?"
+      },
+      "defaultValue": "No"
+    },
+    "adminUsername": {
+      "type": "string",
+      "metadata": {
+        "description": "Username of the administrator account of VM-Series"
+      }
+    },
+    "adminPassword": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Password for the administrator account of VM-Series"
+      }
+    }
+  },
+  "variables": {
+    "apiVersion": "2023-09-01",
+    "vnetName": "[toLower(parameters('vnetName'))]",
+    "fwName": "[toLower(parameters('fwName'))]",
+    "adminIPArray": "[split(parameters('mgmtAdminPrefixes'), ',')]",
+    "imagePublisher": "paloaltonetworks",
+    "imageOffer": "vmseries-flex",
+    "vnetPrefixIP": "[split(parameters('vnetAddressPrefix'), '/')[0]]",
+    "vnetOctets": "[split(variables('vnetPrefixIP'), '.')]",
+    "mgmtSubnetPrefix": "[concat(variables('vnetOctets')[0], '.', variables('vnetOctets')[1], '.', variables('vnetOctets')[2], '.0/26')]",
+    "untrustSubnetPrefix": "[concat(variables('vnetOctets')[0], '.', variables('vnetOctets')[1], '.', variables('vnetOctets')[2], '.64/26')]",
+    "trustSubnetPrefix": "[concat(variables('vnetOctets')[0], '.', variables('vnetOctets')[1], '.', variables('vnetOctets')[2], '.128/26')]",
+    "trustPrefixIP": "[split(variables('trustSubnetPrefix'), '/')[0]]",
+    "trustOctets": "[split(variables('trustPrefixIP'), '.')]",
+    "internalLbPrivateIp": "[concat(variables('trustOctets')[0], '.', variables('trustOctets')[1], '.', variables('trustOctets')[2], '.', string(add(int(variables('trustOctets')[3]), 62)))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('vnetName'), '-publb-pip')]",
+      "location": "[resourceGroup().location]",
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "dnsSettings": {
+          "domainNameLabel": "[concat(variables('vnetName'), '-publb-pip-', uniqueString(resourceGroup().id))]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/loadBalancers",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('vnetName'), '-publb')]",
+      "location": "[resourceGroup().location]",
+      "sku": {
+        "name": "Standard"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/publicIPAddresses', concat(variables('vnetName'), '-publb-pip'))]"
+      ],
+      "properties": {
+        "frontendIPConfigurations": [
+          {
+            "name": "PublicFrontend",
+            "properties": {
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', concat(variables('vnetName'), '-publb-pip'))]"
+              }
+            }
+          }
+        ],
+        "backendAddressPools": [
+          {
+            "name": "UntrustPool"
+          }
+        ],
+        "probes": [
+          {
+            "name": "HTTPS-probe",
+            "properties": {
+              "protocol": "Https",
+              "port": 443,
+              "requestPath": "/php/login.php",
+              "intervalInSeconds": 5,
+              "numberOfProbes": 2
+            }
+          }
+        ],
+        "loadBalancingRules": [
+          {
+            "name": "Allow-HTTP-Inbound",
+            "properties": {
+              "frontendIPConfiguration": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', concat(variables('vnetName'), '-publb'), 'PublicFrontend')]"
+              },
+              "backendAddressPool": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', concat(variables('vnetName'), '-publb'), 'UntrustPool')]"
+              },
+              "probe": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/probes', concat(variables('vnetName'), '-publb'), 'HTTPS-probe')]"
+              },
+              "protocol": "Tcp",
+              "frontendPort": 80,
+              "backendPort": 80,
+              "idleTimeoutInMinutes": 4,
+              "enableFloatingIP": true,
+              "enableTcpReset": true
+            }
+          },
+          {
+            "name": "transit-public-frontend-443",
+            "properties": {
+              "frontendIPConfiguration": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', concat(variables('vnetName'), '-publb'), 'PublicFrontend')]"
+              },
+              "backendAddressPool": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', concat(variables('vnetName'), '-publb'), 'UntrustPool')]"
+              },
+              "probe": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/probes', concat(variables('vnetName'), '-publb'), 'HTTPS-probe')]"
+              },
+              "protocol": "Tcp",
+              "frontendPort": 443,
+              "backendPort": 443,
+              "idleTimeoutInMinutes": 4,
+              "enableFloatingIP": true,
+              "enableTcpReset": true
+            }
+          },
+          {
+            "name": "transit-public-frontend-3389",
+            "properties": {
+              "frontendIPConfiguration": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', concat(variables('vnetName'), '-publb'), 'PublicFrontend')]"
+              },
+              "backendAddressPool": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', concat(variables('vnetName'), '-publb'), 'UntrustPool')]"
+              },
+              "probe": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/probes', concat(variables('vnetName'), '-publb'), 'HTTPS-probe')]"
+              },
+              "protocol": "Tcp",
+              "frontendPort": 3389,
+              "backendPort": 3389,
+              "idleTimeoutInMinutes": 4,
+              "enableFloatingIP": true,
+              "enableTcpReset": true
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/loadBalancers",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('vnetName'), '-intlb')]",
+      "location": "[resourceGroup().location]",
+      "sku": {
+        "name": "Standard"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', concat(variables('vnetName'), '-transit-vnet'))]"
+      ],
+      "properties": {
+        "frontendIPConfigurations": [
+          {
+            "name": "InternalFrontend",
+            "properties": {
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[variables('internalLbPrivateIp')]",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', concat(variables('vnetName'), '-transit-vnet'), concat(variables('vnetName'), '-trust-sn'))]"
+              }
+            }
+          }
+        ],
+        "backendAddressPools": [{ "name": "TrustPool" }],
+        "probes": [
+          {
+            "name": "HTTPS-probe",
+            "properties": {
+              "protocol": "Https",
+              "port": 443,
+              "requestPath": "/php/login.php",
+              "intervalInSeconds": 5,
+              "numberOfProbes": 2
+            }
+          }
+        ],
+        "loadBalancingRules": [
+          {
+            "name": "Allow-All-HA-Ports",
+            "properties": {
+              "frontendIPConfiguration": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', concat(variables('vnetName'), '-intlb'), 'InternalFrontend')]"
+              },
+              "backendAddressPool": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', concat(variables('vnetName'), '-intlb'), 'TrustPool')]"
+              },
+              "probe": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/probes', concat(variables('vnetName'), '-intlb'), 'HTTPS-probe')]"
+              },
+              "protocol": "All",
+              "frontendPort": 0,
+              "backendPort": 0,
+              "enableFloatingIP": true
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('vnetName'), '-mgmt-nsg')]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "allow-mgmt-https",
+            "properties": {
+              "description": "Allow HTTPS to Management Interface",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "443",
+              "sourceAddressPrefixes": "[variables('adminIPArray')]",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 100,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "allow-mgmt-ssh",
+            "properties": {
+              "description": "Allow SSH to Management Interface",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "22",
+              "sourceAddressPrefixes": "[variables('adminIPArray')]",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 110,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('vnetName'), '-untrust-nsg')]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "allow-all-untrust",
+            "properties": {
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 100,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('vnetName'), '-trust-nsg')]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "allow-all-trust",
+            "properties": {
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 100,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('vnetName'), '-transit-vnet')]",
+      "location": "[resourceGroup().location]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', concat(variables('vnetName'), '-mgmt-nsg'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', concat(variables('vnetName'), '-untrust-nsg'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', concat(variables('vnetName'), '-trust-nsg'))]",
+        "[resourceId('Microsoft.Network/routeTables', concat(variables('vnetName'), '-trust-rt'))]"
+      ],
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": ["[parameters('vnetAddressPrefix')]"]
+        },
+        "subnets": [
+          {
+            "name": "[concat(variables('vnetName'), '-mgmt-sn')]",
+            "properties": {
+              "addressPrefix": "[variables('mgmtSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', concat(variables('vnetName'), '-mgmt-nsg'))]"
+              }
+            }
+          },
+          {
+            "name": "[concat(variables('vnetName'), '-untrust-sn')]",
+            "properties": {
+              "addressPrefix": "[variables('untrustSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', concat(variables('vnetName'), '-untrust-nsg'))]"
+              }
+            }
+          },
+          {
+            "name": "[concat(variables('vnetName'), '-trust-sn')]",
+            "properties": {
+              "addressPrefix": "[variables('trustSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', concat(variables('vnetName'), '-trust-nsg'))]"
+              },
+              "routeTable": {
+                "id": "[resourceId('Microsoft.Network/routeTables', concat(variables('vnetName'), '-trust-rt'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/routeTables",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('vnetName'), '-trust-rt')]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "disableBgpRoutePropagation": false,
+        "routes": [
+          {
+            "name": "default",
+            "properties": {
+              "addressPrefix": "0.0.0.0/0",
+              "nextHopType": "VirtualAppliance",
+              "nextHopIpAddress": "[variables('internalLbPrivateIp')]"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/availabilitySets",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('fwName'), '-avset')]",
+      "location": "[resourceGroup().location]",
+      "sku": {
+        "name": "Aligned"
+      },
+      "properties": {
+        "platformUpdateDomainCount": 5,
+        "platformFaultDomainCount": 2
+      }
+    },
+    {
+      "copy": {
+        "name": "mgmtPipLoop",
+        "count": "[parameters('instanceCount')]"
+      },
+      "apiVersion": "[variables('apiVersion')]",
+      "type": "Microsoft.Network/publicIPAddresses",
+      "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), 1), 2, '0'), '-mgmt-pip')]",
+      "location": "[resourceGroup().location]",
+      "condition": "[equals(parameters('deployMgmtPublicIP'), 'Yes')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "dnsSettings": {
+          "domainNameLabel": "[concat(toLower(variables('fwName')), padLeft(add(copyIndex(), 1), 2, '0'), '-', uniqueString(resourceGroup().id))]"
+        }
+      }
+    },
+    {
+      "copy": {
+        "name": "mgmtNicLoop",
+        "count": "[parameters('instanceCount')]"
+      },
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), 1), 2, '0'), '-mgmt')]",
+      "location": "[resourceGroup().location]",
+      "dependsOn": [
+        "mgmtPipLoop",
+        "[resourceId('Microsoft.Network/virtualNetworks', concat(variables('vnetName'), '-transit-vnet'))]"
+      ],
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipconfig-mgmt",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "publicIPAddress": "[if(equals(parameters('deployMgmtPublicIP'), 'Yes'), json(concat('{\"id\": \"', resourceId('Microsoft.Network/publicIPAddresses', concat(variables('fwName'), padLeft(add(copyIndex(), 1), 2, '0'), '-mgmt-pip')), '\"}')), json('null'))]",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', concat(variables('vnetName'), '-transit-vnet'), concat(variables('vnetName'), '-mgmt-sn'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "copy": {
+        "name": "untrustNicLoop",
+        "count": "[parameters('instanceCount')]"
+      },
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), 1), 2, '0'), '-untrust')]",
+      "location": "[resourceGroup().location]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/loadBalancers', concat(variables('vnetName'), '-publb'))]",
+        "[resourceId('Microsoft.Network/virtualNetworks', concat(variables('vnetName'), '-transit-vnet'))]"
+      ],
+      "properties": {
+        "enableIPForwarding": true,
+        "ipConfigurations": [
+          {
+            "name": "ipconfig-untrust",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', concat(variables('vnetName'), '-transit-vnet'), concat(variables('vnetName'), '-untrust-sn'))]"
+              },
+              "loadBalancerBackendAddressPools": [
+                {
+                  "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', concat(variables('vnetName'), '-publb'), 'UntrustPool')]"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "copy": {
+        "name": "trustNicLoop",
+        "count": "[parameters('instanceCount')]"
+      },
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), 1), 2, '0'), '-trust')]",
+      "location": "[resourceGroup().location]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/loadBalancers', concat(variables('vnetName'), '-intlb'))]",
+        "[resourceId('Microsoft.Network/virtualNetworks', concat(variables('vnetName'), '-transit-vnet'))]"
+      ],
+
+      "properties": {
+        "enableIPForwarding": true,
+        "ipConfigurations": [
+          {
+            "name": "ipconfig-trust",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', concat(variables('vnetName'), '-transit-vnet'), concat(variables('vnetName'), '-trust-sn'))]"
+              },
+              "loadBalancerBackendAddressPools": [
+                {
+                  "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', concat(variables('vnetName'), '-intlb'), 'TrustPool')]"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "copy": {
+        "name": "vmLoop",
+        "count": "[parameters('instanceCount')]"
+      },
+      "apiVersion": "[variables('apiVersion')]",
+      "type": "Microsoft.Compute/virtualMachines",
+      "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), 1), 2, '0'), '-vm')]",
+      "location": "[resourceGroup().location]",
+      "dependsOn": [
+        "mgmtNicLoop",
+        "trustNicLoop",
+        "untrustNicLoop",
+        "[resourceId('Microsoft.Compute/availabilitySets', concat(variables('fwName'), '-avset'))]"
+      ],
+      "plan": {
+        "name": "[parameters('imageSku')]",
+        "product": "[variables('imageOffer')]",
+        "publisher": "[variables('imagePublisher')]"
+      },
+      "properties": {
+        "availabilitySet": {
+          "id": "[resourceId('Microsoft.Compute/availabilitySets', concat(variables('fwName'), '-avset'))]"
+        },
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[concat(variables('fwName'), padLeft(add(copyIndex(), 1), 2, '0'))]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "adminPassword": "[parameters('adminPassword')]",
+          "customData": "[base64(parameters('bootstrapData'))]"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "[variables('imagePublisher')]",
+            "offer": "[variables('imageOffer')]",
+            "sku": "[parameters('imageSku')]",
+            "version": "[parameters('imageVersion')]"
+          },
+          "osDisk": {
+            "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), 1), 2, '0'), '-osdisk')]",
+            "caching": "ReadWrite",
+            "createOption": "FromImage",
+            "managedDisk": { "storageAccountType": "Premium_LRS" }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', concat(variables('fwName'), padLeft(add(copyIndex(), 1), 2, '0'), '-mgmt'))]",
+              "properties": {
+                "primary": true
+              }
+            },
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', concat(variables('fwName'), padLeft(add(copyIndex(), 1), 2, '0'), '-untrust'))]",
+              "properties": {
+                "primary": false
+              }
+            },
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', concat(variables('fwName'), padLeft(add(copyIndex(), 1), 2, '0'), '-trust'))]",
+              "properties": {
+                "primary": false
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

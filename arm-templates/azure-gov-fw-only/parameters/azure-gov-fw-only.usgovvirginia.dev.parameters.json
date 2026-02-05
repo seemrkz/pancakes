@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "vnetName": {
+      "value": ""
+    },
+    "fwName": {
+      "value": ""
+    },
+    "instanceCount": {
+      "value": 1
+    },
+    "startingIndex": {
+      "value": 3
+    },
+    "vmSize": {
+      "value": ""
+    },
+    "imageVersion": {
+      "value": ""
+    },
+    "imageSku": {
+      "value": ""
+    },
+    "bootstrapData": {
+      "value": ""
+    },
+    "deployMgmtPublicIP": {
+      "value": ""
+    },
+    "adminUsername": {
+      "value": ""
+    },
+    "adminPassword": {
+      "value": ""
+    }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "vnetName": {
+      "value": ""
+    },
+    "vnetAddressPrefix": {
+      "value": ""
+    },
+    "mgmtSubnetPrefix": {
+      "value": ""
+    },
+    "untrustSubnetPrefix": {
+      "value": ""
+    },
+    "trustSubnetPrefix": {
+      "value": ""
+    },
+    "mgmtAdminPrefixes": {
+      "value": ""
+    },
+    "fwName": {
+      "value": ""
+    },
+    "instanceCount": {
+      "value": 2
+    },
+    "vmSize": {
+      "value": "Standard_DS3_v2"
+    },
+    "imageVersion": {
+      "value": "10.2.1014"
+    },
+    "imageSku": {
+      "value": "byol"
+    },
+    "bootstrapData": {
+      "value": ""
+    },
+    "deployMgmtPublicIP": {
+      "value": "No"
+    },
+    "adminUsername": {
+      "value": ""
+    },
+    "adminPassword": {
+      "value": ""
+    }
+  }
+}

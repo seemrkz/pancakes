@@ -1,0 +1,265 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "vnetName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name prefix of the EXISTING Transit VNET (used to find subnets and LBs)"
+      }
+    },
+    "fwName": {
+      "type": "string",
+      "metadata": {
+        "description": "The prefix for the firewall names (e.g., 'FW' results in 'FW01')(Must match existing firewalls)"
+      }
+    },
+    "instanceCount": {
+      "type": "int",
+      "defaultValue": 1,
+      "minValue": 1,
+      "maxValue": 10,
+      "metadata": {
+        "description": "Number of firewall instances to deploy"
+      }
+    },
+    "startingIndex": {
+      "type": "int",
+      "defaultValue": 1,
+      "metadata": {
+        "description": "The number to start naming from. If you have FW01/02, set this to 3 to get FW03."
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "allowedValues": ["Standard_DS3_v2"],
+      "metadata": {
+        "description": "Azure VM size for VM-Series"
+      },
+      "defaultValue": "Standard_DS3_v2"
+    },
+    "imageVersion": {
+      "type": "string",
+      "allowedValues": ["10.2.1014"],
+      "metadata": {
+        "description": "PAN OS Version"
+      },
+      "defaultValue": "10.2.1014"
+    },
+    "imageSku": {
+      "type": "string",
+      "allowedValues": ["byol", "bundle1", "bundle2"],
+      "metadata": {
+        "description": "Firewall License Model"
+      },
+      "defaultValue": "byol"
+    },
+    "bootstrapData": {
+      "type": "string",
+      "defaultValue": "type=dhcp-client\nhostname=\nvm-auth-key=\npanorama-server=\npanorama-server-2=\ntplname=\ndgname=\ndns-primary=\ndns-secondary=\nop-command-modes=\ndhcp-send-hostname=yes\ndhcp-send-client-id=yes\ndhcp-accept-server-hostname=yes\ndhcp-accept-server-domain=yes",
+      "metadata": {
+        "description": "Base64 encoded user data. Default value contains a template of common init-cfg.txt options separated by newlines."
+      }
+    },
+    "deployMgmtPublicIP": {
+      "type": "string",
+      "allowedValues": ["Yes", "No"],
+      "metadata": {
+        "description": "Deploy public IP for the firewall's management interface?"
+      },
+      "defaultValue": "No"
+    },
+    "adminUsername": {
+      "type": "string",
+      "metadata": {
+        "description": "Username of the administrator account of VM-Series"
+      }
+    },
+    "adminPassword": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Password for the administrator account of VM-Series"
+      }
+    }
+  },
+  "variables": {
+    "apiVersion": "2023-09-01",
+    "vnetName": "[toLower(parameters('vnetName'))]",
+    "fwName": "[toLower(parameters('fwName'))]",
+    "imagePublisher": "paloaltonetworks",
+    "imageOffer": "vmseries-flex"
+  },
+  "resources": [
+    {
+      "copy": {
+        "name": "mgmtPipLoop",
+        "count": "[parameters('instanceCount')]"
+      },
+      "apiVersion": "[variables('apiVersion')]",
+      "type": "Microsoft.Network/publicIPAddresses",
+      "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'), '-mgmt-pip')]",
+      "location": "[resourceGroup().location]",
+      "condition": "[equals(parameters('deployMgmtPublicIP'), 'Yes')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "dnsSettings": {
+          "domainNameLabel": "[concat(toLower(variables('fwName')), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'), '-', uniqueString(resourceGroup().id))]"
+        }
+      }
+    },
+    {
+      "copy": {
+        "name": "mgmtNicLoop",
+        "count": "[parameters('instanceCount')]"
+      },
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'), '-mgmt')]",
+      "location": "[resourceGroup().location]",
+      "dependsOn": ["mgmtPipLoop"],
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipconfig-mgmt",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "publicIPAddress": "[if(equals(parameters('deployMgmtPublicIP'), 'Yes'), json(concat('{\"id\": \"', resourceId('Microsoft.Network/publicIPAddresses', concat(variables('fwName'), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'), '-mgmt-pip')), '\"}')), json('null'))]",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', concat(variables('vnetName'), '-transit-vnet'), concat(variables('vnetName'), '-mgmt-sn'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "copy": {
+        "name": "untrustNicLoop",
+        "count": "[parameters('instanceCount')]"
+      },
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'), '-untrust')]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "enableIPForwarding": true,
+        "ipConfigurations": [
+          {
+            "name": "ipconfig-untrust",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', concat(variables('vnetName'), '-transit-vnet'), concat(variables('vnetName'), '-untrust-sn'))]"
+              },
+              "loadBalancerBackendAddressPools": [
+                {
+                  "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', concat(variables('vnetName'), '-publb'), 'UntrustPool')]"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "copy": {
+        "name": "trustNicLoop",
+        "count": "[parameters('instanceCount')]"
+      },
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "[variables('apiVersion')]",
+      "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'), '-trust')]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "enableIPForwarding": true,
+        "ipConfigurations": [
+          {
+            "name": "ipconfig-trust",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', concat(variables('vnetName'), '-transit-vnet'), concat(variables('vnetName'), '-trust-sn'))]"
+              },
+              "loadBalancerBackendAddressPools": [
+                {
+                  "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', concat(variables('vnetName'), '-intlb'), 'TrustPool')]"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "copy": {
+        "name": "vmLoop",
+        "count": "[parameters('instanceCount')]"
+      },
+      "apiVersion": "[variables('apiVersion')]",
+      "type": "Microsoft.Compute/virtualMachines",
+      "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'), '-vm')]",
+      "location": "[resourceGroup().location]",
+      "dependsOn": ["mgmtNicLoop", "trustNicLoop", "untrustNicLoop"],
+      "plan": {
+        "name": "[parameters('imageSku')]",
+        "product": "[variables('imageOffer')]",
+        "publisher": "[variables('imagePublisher')]"
+      },
+      "properties": {
+        "availabilitySet": {
+          "id": "[resourceId('Microsoft.Compute/availabilitySets', concat(variables('fwName'), '-avset'))]"
+        },
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[concat(variables('fwName'), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'))]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "adminPassword": "[parameters('adminPassword')]",
+          "customData": "[base64(parameters('bootstrapData'))]"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "[variables('imagePublisher')]",
+            "offer": "[variables('imageOffer')]",
+            "sku": "[parameters('imageSku')]",
+            "version": "[parameters('imageVersion')]"
+          },
+          "osDisk": {
+            "name": "[concat(variables('fwName'), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'), '-osdisk')]",
+            "caching": "ReadWrite",
+            "createOption": "FromImage",
+            "managedDisk": {
+              "storageAccountType": "Premium_LRS"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', concat(variables('fwName'), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'), '-mgmt'))]",
+              "properties": {
+                "primary": true
+              }
+            },
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', concat(variables('fwName'), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'), '-untrust'))]",
+              "properties": {
+                "primary": false
+              }
+            },
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', concat(variables('fwName'), padLeft(add(copyIndex(), parameters('startingIndex')), 2, '0'), '-trust'))]",
+              "properties": {
+                "primary": false
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
