@@ -1,7 +1,7 @@
 # PAN CAKES
 
-PAN - Palo Alto Networks
-CAKES - Treats...hopefully you like these
+PAN - Palo Alto Networks  
+CAKES - Treats...hopefully you like these  
 
 ## Repository Layout
 
